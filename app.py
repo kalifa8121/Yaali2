@@ -226,7 +226,7 @@ def init_db():
     conn.close()
 
 init_db()
-
+# --- RULE 6: KUTAA MAAMMILA GALMEESSUU (MAKER) ---
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if 'role' not in session or session['role'] != 'MAKER':
@@ -255,26 +255,14 @@ def register():
             cust_id = str(START_ID) if max_id is None or max_id < START_ID else str(max_id + 1)
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Maammila 'balance=0.0' uumna, sababiin isaa maallaqni hafe 'APPROVED' yoo ta'e dabalama
             cursor.execute("""
                 INSERT INTO customers (customer_id, full_name, phone, gender, account_type, photo_path, signature_path, balance, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 'PENDING_APPROVAL', ?)
-            """, (cust_id, full_name, phone, gender, account_type, photo_filename, sig_filename, now))
-
-            # SIRA HAARAA: Maallaqa jalqabaa akka 'DEPOSIT' galmeessuu fi Txn ID kennuuf
-            if initial_balance > 0:
-                ft_ref = f"INIT{datetime.datetime.now().strftime('%y%j')}{random.randint(10000, 99999)}"
-                txn_id = f"TXN-INIT-{timestamp_str}"
-                cursor.execute("""
-                    INSERT INTO transactions (txn_id, txn_type, customer_id, customer_name, amount, commission, bank_name, ft_reference, status, created_by, timestamp)
-                    VALUES (?, 'DEPOSIT', ?, ?, ?, 0.0, 'Imana Core Bank', ?, 'PENDING_MANAGER', ?, ?)
-                """, (txn_id, cust_id, full_name, initial_balance, ft_ref, session['username'], now))
-
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?)
+            """, (cust_id, full_name, phone, gender, account_type, photo_filename, sig_filename, initial_balance, now))
             conn.commit()
             conn.close()
-            msg = f"⚡ Maammilli {full_name} galmee eegaa jira. Maallaqni jalqabaa {initial_balance} Birr Txn ID: {txn_id} kanaan galmaa'eera. Manager-ni dursa eeyyamsiisaa!"
-
-
+            msg = f"⚡ Maammilli
+            
 def get_bank_capital():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1944,42 +1932,7 @@ def ceo_mudaraba_list():
     """
     return render_template_string(HTML_LAYOUT.replace("{% block content %}{% endblock %}", content), notifications=NOTIFICATIONS)
 
-# --- RULE 6: KUTAA MAAMMILA GALMEESSUU (MAKER) ---
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if 'role' not in session or session['role'] != 'MAKER':
-        return "🚫 Shoora MAKER qofatu maammila galmeessuu danda'a", 403
-
-    msg = None
-    if request.method == 'POST':
-        full_name = request.form.get('full_name').strip()
-        phone = request.form.get('phone').strip()
-        gender = request.form.get('gender')
-        account_type = request.form.get('account_type')
-        initial_balance = max(0.0, float(request.form.get('initial_balance', 0.0)))
-        photo_file = request.files.get('photo')
-        sig_file = request.files.get('signature')
-
-        if photo_file and sig_file and allowed_file(photo_file.filename) and allowed_file(sig_file.filename):
-            timestamp_str = int(datetime.datetime.now().timestamp())
-            photo_filename = compress_and_save_image(photo_file, f"face_{timestamp_str}_" + secure_filename(photo_file.filename))
-            sig_filename = compress_and_save_image(sig_file, f"sig_{timestamp_str}_" + secure_filename(sig_file.filename))
-
-            START_ID = 100099008800
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(CAST(customer_id AS INTEGER)) FROM customers WHERE customer_id >= '100099008800'")
-            max_id = cursor.fetchone()[0]
-            cust_id = str(START_ID) if max_id is None or max_id < START_ID else str(max_id + 1)
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            cursor.execute("""
-                INSERT INTO customers (customer_id, full_name, phone, gender, account_type, photo_path, signature_path, balance, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?)
-            """, (cust_id, full_name, phone, gender, account_type, photo_filename, sig_filename, initial_balance, now))
-            conn.commit()
-            conn.close()
-            msg = f"⚡ Maammilli {full_name} ({account_type}) dafee galmaa'eera! (Acc: {cust_id})."
+ {full_name} ({account_type}) dafee galmaa'eera! (Acc: {cust_id})."
 
     content = f"""
     <div class="box">
