@@ -351,7 +351,7 @@ MOBILE_LAYOUT = """
         .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
         .action-btn { background: white; padding: 16px 12px; border-radius: 16px; border: 1px solid #e2e8f0; display: flex; flex-direction: column; align-items: center; text-decoration: none; color: #1e293b; font-weight: bold; font-size: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.04); text-align: center; }
         .action-btn span.icon { font-size: 24px; margin-bottom: 6px; }
-        .bottom-m-nav { position: fixed; bottom: 0; left: 0; right: 0; background: white; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-around; padding: 12px 0; z-index: 100; box-shadow: 0 -2px 10px rgba(0,0,0,0.05); }
+        .bottom-m-nav { position: fixed; bottom: 0; left: 0; right: 0; background: white; border-top: 1px solid #e2e8f0; display: flex; justify-around: space-around; padding: 12px 0; z-index: 100; box-shadow: 0 -2px 10px rgba(0,0,0,0.05); }
         .bottom-m-nav a { text-align: center; color: #64748b; text-decoration: none; font-size: 11px; font-weight: 600; flex: 1; }
         .bottom-m-nav a span.icon { display: block; font-size: 20px; margin-bottom: 2px; }
         .m-box { background: white; padding: 20px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 2px 6px rgba(0,0,0,0.04); margin-bottom: 16px; }
@@ -471,7 +471,7 @@ def import_customers_csv():
     return render_template_string(HTML_LAYOUT.replace("{% block content %}{% endblock %}", content), notifications=NOTIFICATIONS)
 
 # ==========================================
-# 2. OTHER BANK & WALLET TRANSFERS (Telebirr, CBE Birr, eBirr, Banks)
+# 2. OTHER BANK & WALLET TRANSFERS
 # ==========================================
 
 @app.route('/mobile/external_transfer', methods=['GET', 'POST'])
@@ -494,7 +494,7 @@ def mobile_external_transfer():
         cursor.execute("SELECT balance, pin, freeze_status FROM customers WHERE customer_id = ?", (cust_id,))
         sender = cursor.fetchone()
 
-        service_fee = 5.0 # External gateway fee
+        service_fee = 5.0
         total_deduction = amount + service_fee
 
         if sender['pin'] != pin:
@@ -565,7 +565,7 @@ def mobile_external_transfer():
     return render_template_string(MOBILE_LAYOUT.replace("{% block content %}{% endblock %}", content))
 
 # ==========================================
-# 3. SHOPPING & BILL PAYMENTS (Airtime, Electricity, Water, Merchant)
+# 3. SHOPPING & BILL PAYMENTS
 # ==========================================
 
 @app.route('/mobile/pay_bills', methods=['GET', 'POST'])
@@ -748,6 +748,8 @@ def mobile_dashboard():
         </div>
         """
 
+    empty_txn_msg = '<p style="font-size:12px; color:#94a3b8; text-align:center;">Socho\'iinsi raawwatame hin jiru.</p>'
+
     content = f"""
     <div class="balance-card">
         <div class="balance-label">Haftee Qarshii (Available Balance)</div>
@@ -764,7 +766,7 @@ def mobile_dashboard():
 
     <div class="m-box">
         <h3 style="font-size:14px; color:#065f46; margin-bottom:10px;">🕒 Socho'iinsa Dhiyootti</h3>
-        {txns_html if txns_html else '<p style="font-size:12px; color:#94a3b8; text-align:center;">Socho\'iinsi raawwatame hin jiru.</p>'}
+        {txns_html if txns_html else empty_txn_msg}
     </div>
     """
     return render_template_string(MOBILE_LAYOUT.replace("{% block content %}{% endblock %}", content))
@@ -888,12 +890,14 @@ def mobile_statement():
         </div>
         """
 
+    empty_stmt_msg = '<p style="font-size:12px; color:#94a3b8; text-align:center; padding:20px;">Socho\'iinsi raawwatame hin jiru.</p>'
+
     content = f"""
     <div class="m-box">
         <h2 style="font-size:16px; color:#065f46; margin-bottom:4px;">📜 Seenaa Herregaa (Mini Statement)</h2>
         <p style="font-size:12px; color:#64748b; margin-bottom:12px;">Haftee Amajji: <b>{c['balance']:,.2f} Birr</b></p>
         <div style="border-top:1px dashed #cbd5e1; padding-top:8px;">
-            {txns_html if txns_html else '<p style="font-size:12px; color:#94a3b8; text-align:center; padding:20px;">Socho\'iinsi raawwatame hin jiru.</p>'}
+            {txns_html if txns_html else empty_stmt_msg}
         </div>
     </div>
     """
@@ -997,6 +1001,8 @@ def customers_list():
         </tr>
         """
 
+    no_cust_msg = '<tr><td colspan="6" style="padding:15px; text-align:center;">Maammilli galmaa\'e hin jiru.</td></tr>'
+
     content = f"""
     <div class="box">
         <h2 style="font-size: 16px; color:#065f46; margin-bottom: 12px;">👥 Maammiltoota Database Keessa Jiran</h2>
@@ -1013,7 +1019,7 @@ def customers_list():
                     </tr>
                 </thead>
                 <tbody>
-                    {cust_rows if cust_rows else '<tr><td colspan="6" style="padding:15px; text-align:center;">Maammilli galmaa'e hin jiru.</td></tr>'}
+                    {cust_rows if cust_rows else no_cust_msg}
                 </tbody>
             </table>
         </div>
