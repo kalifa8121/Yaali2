@@ -5,8 +5,9 @@ import datetime
 import random
 import sys
 import time
+import secrets
 from io import BytesIO
-from html import escape
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # PIL (Pillow) exception handling for Render deployment stability
 try:
@@ -32,36 +33,11 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 NOTIFICATIONS = []
 
 # --- NEON.TECH / POSTGRESQL DATABASE CONNECTION ---
-# Never keep a database password in source code. Configure DATABASE_URL as a
-# deployment secret/environment variable instead.
-DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
-
-SUPPORTED_BANKS = [
-    ("CBE", "Commercial Bank of Ethiopia"),
-    ("AWASH", "Awash Bank"),
-    ("DASHEN", "Dashen Bank"),
-    ("COOP", "Cooperative Bank of Oromia"),
-    ("ABAY", "Abay Bank"),
-    ("BUNNA", "Bunna Bank"),
-    ("PRIDE", "PRIDE Microfinance"),
-]
-
-PAYMENT_SERVICES = [
-    ("TELEBIRR", "Telebirr"),
-    ("CHAPA", "Chapa"),
-    ("ETHIO_TELECOM", "Ethio telecom"),
-    ("ETHIOPIAN_AIRLINES", "Ethiopian Airlines"),
-    ("ELECTRICITY", "Ethiopian Electric Utility"),
-    ("WATER", "Water bill"),
-]
+DEFAULT_DB_URL = 'postgresql://neondb_owner:PAASWORDII_SIRRII_KANAAN_BAKKA_BUUSAA@ep-cool-sample-a5xyz.us-east-2.aws.neon.tech/neondb?sslmode=require'
+DATABASE_URL = os.environ.get('DATABASE_URL', DEFAULT_DB_URL)
 
 def get_db_connection(max_retries=5, delay=0.5):
     """Establishes connection to Neon.tech PostgreSQL database with retry logic"""
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL hin qindaa'in. Database connection string kee "
-            "deployment secret/environment variable keessatti kaa'i."
-        )
     for attempt in range(max_retries):
         try:
             conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -213,27 +189,13 @@ def init_db():
         );
     """)
 
-    # Mobile banking metadata. These columns are additive so existing
-    # installations keep their old transactions and statements.
+    # --- MIGRATION: customer self-service app support (PIN login + tokens) ---
+    cursor.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pin VARCHAR(255);")
     cursor.execute("""
-        ALTER TABLE transactions
-        ADD COLUMN IF NOT EXISTS destination_type VARCHAR(50) DEFAULT 'ACCOUNT',
-        ADD COLUMN IF NOT EXISTS destination_name VARCHAR(255) DEFAULT '',
-        ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(255) DEFAULT '';
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS mobile_beneficiaries (
-            beneficiary_id VARCHAR(100) PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS customer_sessions (
+            token VARCHAR(100) PRIMARY KEY,
             customer_id VARCHAR(100) NOT NULL,
-            beneficiary_type VARCHAR(30) NOT NULL,
-            bank_code VARCHAR(50),
-            bank_name VARCHAR(255),
-            account_number VARCHAR(100),
-            beneficiary_name VARCHAR(255),
-            merchant_code VARCHAR(100),
-            created_at VARCHAR(100),
-            active BOOLEAN DEFAULT TRUE
+            created_at VARCHAR(100)
         );
     """)
 
@@ -243,6 +205,36 @@ def init_db():
 
 init_db()
 
+# Optional safety cap for the customer self-service app (no manager approval path).
+# Set env var CUSTOMER_TXN_AUTO_LIMIT to a number to force anything above it into the
+# manager queue instead of auto-approving. Leave at 0 to fully disable (no cap at all).
+CUSTOMER_TXN_AUTO_LIMIT = float(os.environ.get('CUSTOMER_TXN_AUTO_LIMIT', 0))
+
+def get_customer_by_token(token):
+    """Looks up the customer tied to a mobile-app bearer token."""
+    if not token:
+        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT customer_id FROM customer_sessions WHERE token = %s;", (token,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.close()
+        conn.close()
+        return None
+    cursor.execute("SELECT * FROM customers WHERE customer_id = %s;", (row['customer_id'],))
+    cust = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return cust
+
+def get_bearer_token():
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        return auth.split(' ', 1)[1].strip()
+    data = request.get_json(silent=True) or {}
+    return data.get('token') or request.form.get('token') or request.args.get('token')
+
 def get_bank_capital():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -251,12 +243,7 @@ def get_bank_capital():
     res = cursor.fetchone()
     total_deposit = float(res['val']) if res and res['val'] is not None else 0.0
     
-    cursor.execute("""
-        SELECT SUM(amount) AS val
-        FROM transactions
-        WHERE status='APPROVED'
-          AND txn_type IN ('WITHDRAWAL', 'T24_TRANSFER', 'BANK_TRANSFER', 'BILL_PAYMENT');
-    """)
+    cursor.execute("SELECT SUM(amount) AS val FROM transactions WHERE status='APPROVED' AND txn_type IN ('WITHDRAWAL', 'T24_TRANSFER');")
     res = cursor.fetchone()
     total_withdraw = float(res['val']) if res and res['val'] is not None else 0.0
     
@@ -516,7 +503,6 @@ def dashboard():
         maker_btns = """
         <a href="/register" class="btn-card"><span class="icon">👤</span><span>Galmee Maammilaa</span></a>
         <a href="/transaction" class="btn-card"><span class="icon">💸</span><span>Deposit / Transfer / Withdraw</span></a>
-        <a href="/mobile_banking" class="btn-card"><span class="icon">📱</span><span>Mobile Banking: Bankii fi Kaffaltii</span></a>
         <a href="/maker_receipts" class="btn-card"><span class="icon">🧾</span><span>Nagahee Maxxansi</span></a>
         """
 
@@ -524,7 +510,6 @@ def dashboard():
     if role == 'MANAGER':
         manager_btns = """
         <a href="/pending" class="btn-card"><span class="icon">🔍</span><span>Manager Approval</span></a>
-        <a href="/mobile_banking" class="btn-card"><span class="icon">📱</span><span>Mobile Banking</span></a>
         <a href="/reversals_list" class="btn-card"><span class="icon">🔄</span><span>Reversal Approvals</span></a>
         """
 
@@ -539,12 +524,6 @@ def dashboard():
     if role in ['LOAN_OFFICER', 'CEO', 'MANAGER']:
         loan_btn = """
         <a href="/islamic_loan" class="btn-card btn-card-loan"><span class="icon">📜</span><span>Mudaraba & Murabaha Loan</span></a>
-        """
-
-    mobile_btn = ""
-    if role == 'CEO':
-        mobile_btn = """
-        <a href="/mobile_banking" class="btn-card btn-card-ceo"><span class="icon">📱</span><span>Mobile Banking</span></a>
         """
 
     ceo_btn = ""
@@ -587,7 +566,6 @@ def dashboard():
         {manager_btns}
         {auditor_btns}
         {loan_btn}
-        {mobile_btn}
         <a href="/customers" class="btn-card"><span class="icon">👥</span><span>Listii Maammiltootaa</span></a>
         {ceo_btn}
     </div>
@@ -879,287 +857,6 @@ def transaction():
         var a2 = document.getElementById('amount_confirm').value;
         if (parseFloat(a1) !== parseFloat(a2)) {{
             alert("❌ Dogoggora! Hammi maallaqaa bakka lamatti galchitan wal-hin simu. Maaloo irra deebi'a mirkaneessaa.");
-            return false;
-        }}
-        return true;
-    }}
-    </script>
-    """
-    return render_template_string(HTML_LAYOUT.replace("{% block content %}{% endblock %}", content), notifications=NOTIFICATIONS)
-
-# --- MOBILE BANKING: INTER-BANK TRANSFERS & BILL PAYMENTS ---
-@app.route('/mobile_banking', methods=['GET', 'POST'])
-def mobile_banking():
-    """Create a controlled mobile-banking instruction for manager approval.
-
-    This is a ledger/approval integration point. It does not pretend to move
-    money through a bank API. A live deployment should replace the settlement
-    step in manager_action() with the bank/payment-switch API for that bank.
-    """
-    if 'role' not in session or session['role'] not in ['MAKER', 'MANAGER', 'CEO']:
-        if 'role' not in session:
-            return redirect('/login')
-        return "🚫 Mobile banking uumuu kan danda'an Maker, Manager ykn CEO qofa.", 403
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    msg = None
-    msg_type = "green"
-
-    if request.method == 'POST':
-        operation = request.form.get('operation', 'BANK_TRANSFER').strip()
-        source_account = request.form.get('source_account', '').strip()
-        amount_text = request.form.get('amount', '').strip()
-        amount_confirm_text = request.form.get('amount_confirm', '').strip()
-        amount = 0.0
-
-        try:
-            amount = round(float(amount_text), 2)
-            amount_confirm = round(float(amount_confirm_text), 2)
-        except (TypeError, ValueError):
-            amount_confirm = -1
-
-        cursor.execute("""
-            SELECT customer_id, full_name, balance, freeze_status, phone
-            FROM customers
-            WHERE customer_id = %s AND status = 'ACTIVE';
-        """, (source_account,))
-        source = cursor.fetchone()
-
-        error = None
-        if operation not in ['BANK_TRANSFER', 'BILL_PAYMENT']:
-            error = "❌ Gosa hojii sirrii filadhu."
-        elif amount <= 0:
-            error = "❌ Hamma maallaqaa 0 caalu galchi."
-        elif amount != amount_confirm:
-            error = "❌ Hamma maallaqaa lamaanuu wal-qixa ta'uu qabu."
-        elif not source:
-            error = "❌ Source account active ta'e hin argamne."
-        elif source['freeze_status'] == 'FROZEN':
-            error = "🔒 Source account kun uggurameera; transfer ykn kaffaltii hin danda'amu."
-
-        txn_type = operation
-        bank_name = ""
-        target_account = ""
-        destination_type = ""
-        destination_name = ""
-        payment_reference = ""
-
-        if not error and operation == 'BANK_TRANSFER':
-            bank_code = request.form.get('bank_code', '').strip()
-            bank_lookup = dict(SUPPORTED_BANKS)
-            bank_name = bank_lookup.get(bank_code, "")
-            target_account = request.form.get('beneficiary_account', '').strip()
-            destination_name = request.form.get('beneficiary_name', '').strip()
-            destination_type = "BANK_ACCOUNT"
-
-            if not bank_name:
-                error = "❌ Baankii fudhataa filadhu."
-            elif not target_account or len(target_account) < 6 or len(target_account) > 30:
-                error = "❌ Lakkoofsa accountii fudhataa sirrii galchi (6-30 characters)."
-            elif not destination_name:
-                error = "❌ Maqaa abbaa accountii fudhataa galchi."
-            elif bank_code == 'INTERNAL':
-                error = "❌ Baankii keessaa irratti qofa account ID Imana fayyadami."
-
-        if not error and operation == 'BILL_PAYMENT':
-            service_code = request.form.get('service_code', '').strip()
-            service_lookup = dict(PAYMENT_SERVICES)
-            bank_name = service_lookup.get(service_code, "")
-            payment_reference = request.form.get('payment_reference', '').strip()
-            destination_name = bank_name
-            destination_type = "BILLER"
-            target_account = payment_reference
-
-            if not bank_name:
-                error = "❌ Tajaajila kaffaltii filadhu."
-            elif not payment_reference or len(payment_reference) < 3 or len(payment_reference) > 80:
-                error = "❌ Reference kaffaltii (bilbila, meter ykn account) sirrii galchi."
-
-        if not error and source and float(source['balance']) < amount:
-            error = (
-                f"❌ Balansii gahaa miti. Jiru: {float(source['balance']):,.2f} "
-                f"Birr; barbaachisu: {amount:,.2f} Birr."
-            )
-
-        if not error:
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            suffix = random.randint(10000, 99999)
-            txn_id = f"MB-{datetime.datetime.now().strftime('%y%m%d%H%M%S')}-{suffix}"
-            ft_ref = f"FT{datetime.datetime.now().strftime('%y%j')}{suffix}"
-            cursor.execute("""
-                INSERT INTO transactions (
-                    txn_id, txn_type, customer_id, customer_name, target_account,
-                    amount, commission, bank_name, ft_reference, status, created_by,
-                    timestamp, destination_type, destination_name, payment_reference
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s, 'PENDING_MANAGER',
-                        %s, %s, %s, %s, %s);
-            """, (
-                txn_id, txn_type, source_account, source['full_name'], target_account,
-                amount, bank_name, ft_ref, session['username'], now,
-                destination_type, destination_name, payment_reference
-            ))
-            conn.commit()
-            msg = (
-                f"✅ {('Bankii transfer' if operation == 'BANK_TRANSFER' else 'Kaffaltiin billii')} "
-                f"{amount:,.2f} Birr galmaa'eera. Ref: {ft_ref}. "
-                "Manager approval eeggachaa jira."
-            )
-            add_notification(f"Mobile banking request haaraa: {ft_ref} ({txn_type})")
-        else:
-            msg = error
-            msg_type = "red"
-
-    cursor.execute("""
-        SELECT customer_id, full_name, balance, phone
-        FROM customers
-        WHERE status = 'ACTIVE'
-        ORDER BY full_name ASC;
-    """)
-    mobile_customers = cursor.fetchall()
-    cursor.execute("""
-        SELECT txn_id, txn_type, customer_name, amount, bank_name, target_account,
-               destination_name, ft_reference, status, timestamp
-        FROM transactions
-        WHERE txn_type IN ('BANK_TRANSFER', 'BILL_PAYMENT')
-        ORDER BY timestamp DESC
-        LIMIT 20;
-    """)
-    mobile_txns = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    customer_options = "".join(
-        f'<option value="{escape(str(c["customer_id"]))}">'
-        f'{escape(str(c["full_name"]))} - {escape(str(c["customer_id"]))} '
-        f'(Bal: {float(c["balance"]):,.2f} Birr)</option>'
-        for c in mobile_customers
-    )
-    bank_options = "".join(
-        f'<option value="{escape(code)}">{escape(name)}</option>'
-        for code, name in SUPPORTED_BANKS
-    )
-    service_options = "".join(
-        f'<option value="{escape(code)}">{escape(name)}</option>'
-        for code, name in PAYMENT_SERVICES
-    )
-    tx_rows = ""
-    for t in mobile_txns:
-        badge_cls = "badge-active" if t['status'] == 'APPROVED' else (
-            "badge-danger" if 'REJECTED' in t['status'] else "badge-pending"
-        )
-        tx_rows += f"""
-        <tr style="border-bottom:1px solid #e2e8f0; font-size:11px;">
-            <td style="padding:8px;">{escape(str(t['timestamp']))}</td>
-            <td style="padding:8px; font-weight:bold;">{escape(str(t['ft_reference']))}</td>
-            <td style="padding:8px;">{escape(str(t['txn_type']))}</td>
-            <td style="padding:8px;">{escape(str(t['bank_name'] or t['destination_name'] or '-'))}</td>
-            <td style="padding:8px; font-weight:bold;">{float(t['amount']):,.2f}</td>
-            <td style="padding:8px;"><span class="badge {badge_cls}">{escape(str(t['status']))}</span></td>
-        </tr>
-        """
-
-    content = f"""
-    <div class="box">
-        <h2 style="font-size:16px; color:#065f46; margin-bottom:4px;">📱 Mobile Banking</h2>
-        <p style="font-size:11px; color:#64748b; margin-bottom:14px;">
-            Baankii gara baankii biraatti ergi ykn billii kaffali. Gaaffiin hundi Manager'n
-            mirkanaa'a; kunis maallaqa dogoggoraan ba'uu irraa eega.
-        </p>
-        {f"<p style='background:{'#dcfce7' if msg_type=='green' else '#fee2e2'}; color:{'#166534' if msg_type=='green' else '#991b1b'}; padding:10px; border-radius:6px; font-size:12px; font-weight:bold; margin-bottom:12px;'>{escape(msg)}</p>" if msg else ""}
-
-        <form method="POST" onsubmit="return validateMobileAmount()">
-            <div class="form-group">
-                <label>Gosa Hojii</label>
-                <select name="operation" id="mobile_operation" class="input-field" onchange="toggleMobileFields()">
-                    <option value="BANK_TRANSFER">🏦 Bankii biraatti maallaqa ergi</option>
-                    <option value="BILL_PAYMENT">🧾 Bill / tajaajila kaffali</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Source Account (Akaawuntii baasii)</label>
-                <select name="source_account" required class="input-field">
-                    <option value="">-- Akaawuntii filadhu --</option>
-                    {customer_options}
-                </select>
-            </div>
-
-            <div id="bank_transfer_fields">
-                <div class="form-group">
-                    <label>Baankii Fudhataa</label>
-                    <select name="bank_code" class="input-field">
-                        <option value="">-- Baankii filadhu --</option>
-                        {bank_options}
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Account Number Fudhataa</label>
-                    <input type="text" name="beneficiary_account" maxlength="30"
-                           placeholder="Fkn: 1000123456789" class="input-field">
-                </div>
-                <div class="form-group">
-                    <label>Maqaa Abbaa Accountii</label>
-                    <input type="text" name="beneficiary_name" maxlength="255"
-                           placeholder="Maqaa guutuu" class="input-field">
-                </div>
-            </div>
-
-            <div id="bill_payment_fields" style="display:none;">
-                <div class="form-group">
-                    <label>Tajaajila / Biller</label>
-                    <select name="service_code" class="input-field">
-                        <option value="">-- Tajaajila filadhu --</option>
-                        {service_options}
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Payment Reference</label>
-                    <input type="text" name="payment_reference" maxlength="80"
-                           placeholder="Bilbila, meter number ykn customer ID" class="input-field">
-                </div>
-            </div>
-
-            <div class="form-group">
-                <label>Hamma Maallaqaa (Birr)</label>
-                <input type="number" step="0.01" min="0.01" id="mobile_amount"
-                       name="amount" placeholder="0.00" required class="input-field">
-            </div>
-            <div class="form-group">
-                <label>Hamma Maallaqaa Irra Deebi'i</label>
-                <input type="number" step="0.01" min="0.01" id="mobile_amount_confirm"
-                       name="amount_confirm" placeholder="0.00" required class="input-field">
-            </div>
-            <button type="submit" class="btn-submit">📤 Ergi / Kaffali (Manager Approval)</button>
-        </form>
-    </div>
-
-    <div class="box" style="padding:0; overflow-x:auto;">
-        <h3 style="font-size:14px; color:#065f46; padding:12px 12px 0;">📋 Mobile Banking Requests</h3>
-        <table style="width:100%; border-collapse:collapse; text-align:left;">
-            <thead>
-                <tr style="background:#f8fafc; font-size:11px; color:#64748b; border-bottom:1px solid #e2e8f0;">
-                    <th style="padding:8px;">Guyyaa</th><th style="padding:8px;">Ref</th>
-                    <th style="padding:8px;">Type</th><th style="padding:8px;">Destination</th>
-                    <th style="padding:8px;">Hamma</th><th style="padding:8px;">Status</th>
-                </tr>
-            </thead>
-            <tbody>
-                {tx_rows if tx_rows else '<tr><td colspan="6" style="padding:16px; text-align:center; color:#64748b;">Gaaffiin mobile banking hin jiru.</td></tr>'}
-            </tbody>
-        </table>
-    </div>
-    <script>
-    function toggleMobileFields() {{
-        var isTransfer = document.getElementById('mobile_operation').value === 'BANK_TRANSFER';
-        document.getElementById('bank_transfer_fields').style.display = isTransfer ? 'block' : 'none';
-        document.getElementById('bill_payment_fields').style.display = isTransfer ? 'none' : 'block';
-    }}
-    function validateMobileAmount() {{
-        var a = parseFloat(document.getElementById('mobile_amount').value);
-        var b = parseFloat(document.getElementById('mobile_amount_confirm').value);
-        if (!Number.isFinite(a) || a <= 0 || a !== b) {{
-            alert("❌ Hamma maallaqaa lamaanuu wal-qixa ta'uu qabu.");
             return false;
         }}
         return true;
@@ -1757,9 +1454,7 @@ def pending():
     cursor.execute("""
         SELECT 
             t.txn_id, t.txn_type, t.customer_name, t.amount, t.bank_name, t.status,
-            c.photo_path, c.signature_path, c.national_id_path, c.phone, t.customer_id,
-            t.ft_reference, t.target_account, t.commission, t.destination_name,
-            t.payment_reference,
+            c.photo_path, c.signature_path, c.national_id_path, c.phone, t.customer_id, t.ft_reference, t.target_account, t.commission,
             c.freeze_status, c.freeze_reason, c.gender, c.account_type
         FROM transactions t
         LEFT JOIN customers c ON t.customer_id = c.customer_id
@@ -1803,13 +1498,6 @@ def pending():
         cards_html += "<h3 style='font-size:12px; color:#b45309; margin-top:16px; margin-bottom:8px;'>💵 Kaffaltii Maker Uume - Mirkaneessa Eeggatu</h3>"
         for r in pending_txns:
             freeze_info = f"<span class='badge badge-frozen'>🔒 UGGURAMEERA ({r['freeze_reason']})</span>" if r['freeze_status'] == 'FROZEN' else "<span class='badge badge-active'>✅ Active</span>"
-            destination_value = r['destination_name'] or r['target_account'] or '-'
-            payment_ref_html = f" (Ref: {r['payment_reference']})" if r['payment_reference'] else ""
-            destination_html = (
-                f"<div style='font-size:11px; color:#475569; margin-bottom:8px;'>"
-                f"Destination: <b>{destination_value}</b>{payment_ref_html}</div>"
-                if r['txn_type'] in ['BANK_TRANSFER', 'BILL_PAYMENT'] else ""
-            )
             
             cards_html += f"""
             <div class="item-card">
@@ -1819,7 +1507,6 @@ def pending():
                 </div>
                 <div style="font-size:13px; font-weight:bold;">{r['txn_type']}: {float(r['amount']):,.2f} Birr ({r['bank_name']})</div>
                 <div style="font-size:11px; color:#64748b; margin-bottom:8px;">Maammila: <b>{r['customer_name']}</b> ({r['customer_id']})</div>
-                {destination_html}
                 
                 <div style="margin-bottom:8px;">Status Ugguraa: {freeze_info}</div>
 
@@ -1898,12 +1585,7 @@ def manager_action(act, txn_id):
     cursor = conn.cursor()
 
     if act == 'approve':
-        cursor.execute("""
-            SELECT txn_type, customer_id, target_account, amount, commission,
-                   ft_reference, bank_name, destination_type, destination_name,
-                   payment_reference
-            FROM transactions WHERE txn_id = %s;
-        """, (txn_id,))
+        cursor.execute("SELECT txn_type, customer_id, target_account, amount, commission, ft_reference FROM transactions WHERE txn_id = %s;", (txn_id,))
         row = cursor.fetchone()
         if row:
             txn_type = row['txn_type']
@@ -1912,9 +1594,6 @@ def manager_action(act, txn_id):
             amount = float(row['amount'])
             commission = float(row['commission'])
             ft_ref = row['ft_reference']
-            bank_name = row['bank_name'] or ""
-            destination_name = row['destination_name'] or ""
-            payment_reference = row['payment_reference'] or ""
 
             cursor.execute("SELECT balance, phone, full_name, freeze_status FROM customers WHERE customer_id = %s;", (cust_id,))
             cust = cursor.fetchone()
@@ -1937,30 +1616,10 @@ def manager_action(act, txn_id):
                 elif txn_type == 'T24_TRANSFER':
                     cursor.execute("UPDATE customers SET balance = balance - %s WHERE customer_id = %s;", (amount, cust_id))
                     cursor.execute("UPDATE customers SET balance = balance + %s WHERE customer_id = %s;", (amount, target_acc))
-                elif txn_type == 'BANK_TRANSFER':
-                    # External bank settlement belongs in a provider adapter.
-                    # The ledger debit is recorded here after approval. Internal
-                    # Imana accounts can be credited immediately.
-                    cursor.execute("UPDATE customers SET balance = balance - %s WHERE customer_id = %s;", (amount, cust_id))
-                    if bank_name == 'Imana Microfinance Core':
-                        cursor.execute("""
-                            UPDATE customers
-                            SET balance = balance + %s
-                            WHERE customer_id = %s AND status = 'ACTIVE';
-                        """, (amount, target_acc))
-                elif txn_type == 'BILL_PAYMENT':
-                    # Billers are external destinations; approval debits the
-                    # source ledger and leaves the provider settlement trace.
-                    cursor.execute("UPDATE customers SET balance = balance - %s WHERE customer_id = %s;", (amount, cust_id))
 
                 cursor.execute("UPDATE transactions SET status = 'APPROVED' WHERE txn_id = %s;", (txn_id,))
 
-                destination_note = ""
-                if txn_type == 'BANK_TRANSFER':
-                    destination_note = f" gara {bank_name} / {target_acc}"
-                elif txn_type == 'BILL_PAYMENT':
-                    destination_note = f" ({destination_name}, Ref {payment_reference})"
-                msg_cust = f"Kabajamoo {name}, {txn_type} {amount:,.2f} Birr{destination_note} (Ref: {ft_ref}) mirkanaa'ee xumurameera."
+                msg_cust = f"Kabajamoo {name}, {txn_type} {amount:,.2f} Birr (Ref: {ft_ref}) mirkanaa'ee xumurameera."
                 send_sms_alert(phone, msg_cust)
                 add_notification(f"Transaction {ft_ref} ({txn_type} {amount:,.2f} Birr) APPROVED ta'ee jira.")
 
@@ -2249,8 +1908,15 @@ def customers():
                 """
 
         edit_btn = ""
+        pin_form = ""
         if session['role'] == 'MANAGER':
             edit_btn = f'<a href="/edit_customer/{r["customer_id"]}" class="btn-action btn-blue" style="font-size:10px; padding:3px 8px; margin-right:4px;">✏️ Edit</a>'
+            pin_form = f"""
+            <form method="POST" action="/set_customer_pin/{r['customer_id']}" style="display:inline-flex; gap:4px; margin-right:4px;">
+                <input type="password" name="pin" placeholder="PIN App" minlength="4" required class="input-field" style="font-size:10px; padding:3px 6px; width:70px; margin:0;">
+                <button type="submit" class="btn-action btn-blue" style="font-size:10px; padding:3px 8px;">🔑 Set PIN</button>
+            </form>
+            """
 
         print_form_btn = f'<a href="/print_customer_form/{r["customer_id"]}" target="_blank" class="btn-action btn-purple" style="font-size:10px; padding:3px 8px; margin-right:4px;">🖨️ Formii</a>'
         statement_btn = f'<a href="/statement/{r["customer_id"]}" class="btn-action btn-orange" style="font-size:10px; padding:3px 8px;">📜 Statement</a>'
@@ -2274,6 +1940,7 @@ def customers():
                     <p style="font-size:12px; font-weight:bold; color:#065f46;">Balance: {float(r['balance']):,.2f} Birr</p>
                     <div>
                         {ceo_freeze_form}
+                        {pin_form}
                         {edit_btn}
                         {print_form_btn}
                         {statement_btn}
@@ -2421,6 +2088,255 @@ def print_receipt(txn_id):
     </body>
     </html>
     """
+
+# ==========================================================================
+# CUSTOMER SELF-SERVICE MOBILE APP API (for the Android/iOS APK)
+# These endpoints are for CUSTOMERS logging in with their own PIN, not staff.
+# They auto-complete (status='APPROVED') with NO manager approval step,
+# since the customer is authenticating and authorizing their own money —
+# same model as any normal mobile banking app. All of them still write a
+# full row to `transactions` (audited_status='OPEN') so auditors/CEO can
+# review the activity afterwards in the existing audit screens.
+# ==========================================================================
+
+@app.route('/api/customer/login', methods=['POST'])
+def api_customer_login():
+    data = request.get_json(silent=True) or request.form
+    cust_id = (data.get('customer_id') or '').strip()
+    pin = (data.get('pin') or '').strip()
+
+    if not cust_id or not pin:
+        return jsonify(success=False, message="customer_id fi pin barbaachisaadha"), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM customers WHERE customer_id = %s;", (cust_id,))
+    cust = cursor.fetchone()
+
+    if not cust or not cust['pin'] or not check_password_hash(cust['pin'], pin):
+        cursor.close(); conn.close()
+        return jsonify(success=False, message="Account ID ykn PIN sirrii miti"), 401
+
+    if cust['status'] != 'ACTIVE':
+        cursor.close(); conn.close()
+        return jsonify(success=False, message="Akkaawuntiin kun ammatti hin banamne"), 403
+
+    if cust['freeze_status'] == 'FROZEN':
+        cursor.close(); conn.close()
+        return jsonify(success=False, message="Akkaawuntiin kun uguramaadha"), 403
+
+    token = secrets.token_hex(32)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO customer_sessions (token, customer_id, created_at) VALUES (%s, %s, %s);",
+                   (token, cust_id, now))
+    conn.commit()
+    cursor.close(); conn.close()
+
+    return jsonify(success=True, token=token, full_name=cust['full_name'],
+                    balance=float(cust['balance']), customer_id=cust_id)
+
+
+@app.route('/api/customer/change_pin', methods=['POST'])
+def api_customer_change_pin():
+    data = request.get_json(silent=True) or request.form
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+
+    new_pin = (data.get('new_pin') or '').strip()
+    if not new_pin or len(new_pin) < 4:
+        return jsonify(success=False, message="PIN haaraan yoo xiqqaate lakkoofsa 4 qabaachuu qaba"), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE customers SET pin = %s WHERE customer_id = %s;",
+                   (generate_password_hash(new_pin), cust['customer_id']))
+    conn.commit()
+    cursor.close(); conn.close()
+    return jsonify(success=True, message="PIN jijjiirameera")
+
+
+@app.route('/api/customer/balance')
+def api_customer_balance():
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+    return jsonify(success=True, customer_id=cust['customer_id'], full_name=cust['full_name'],
+                    balance=float(cust['balance']), freeze_status=cust['freeze_status'])
+
+
+@app.route('/api/customer/statement')
+def api_customer_statement():
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT txn_id, txn_type, target_account, amount, commission, bank_name, ft_reference, status, timestamp
+        FROM transactions WHERE customer_id = %s ORDER BY timestamp DESC LIMIT 50;
+    """, (cust['customer_id'],))
+    rows = cursor.fetchall()
+    cursor.close(); conn.close()
+    txns = [dict(r) for r in rows]
+    for t in txns:
+        t['amount'] = float(t['amount'])
+        t['commission'] = float(t['commission'])
+    return jsonify(success=True, transactions=txns)
+
+
+def _customer_self_service_txn(cust, txn_type, target_account, amount, bank_name, extra_note=""):
+    """Shared logic: validates and auto-completes a customer-initiated transaction.
+    Returns (json_response, http_status)."""
+    if amount is None or amount <= 0:
+        return jsonify(success=False, message="Hamma maallaqaa sirrii galchaa"), 400
+
+    if cust['freeze_status'] == 'FROZEN':
+        return jsonify(success=False, message="Akkaawuntiin kee uguramaadha"), 403
+
+    commission = 0.0  # no commission on customer self-service moves; adjust here if you want one
+    total_deduction = amount + commission
+
+    if float(cust['balance']) < total_deduction:
+        return jsonify(success=False, message="Balansiin hin gahu"), 400
+
+    # Optional safety cap: large amounts fall back to the manager queue instead of auto-approving.
+    force_manual = CUSTOMER_TXN_AUTO_LIMIT > 0 and amount > CUSTOMER_TXN_AUTO_LIMIT
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if txn_type == 'P2P_TRANSFER':
+        cursor.execute("SELECT customer_id, full_name, status FROM customers WHERE customer_id = %s;", (target_account,))
+        target = cursor.fetchone()
+        if not target or target['status'] != 'ACTIVE':
+            cursor.close(); conn.close()
+            return jsonify(success=False, message="Herrega nama fudhatuu hin argamne"), 404
+        if target['customer_id'] == cust['customer_id']:
+            cursor.close(); conn.close()
+            return jsonify(success=False, message="Ofii keetti maallaqa dabarsuu hin dandeessu"), 400
+
+    timestamp_str = int(datetime.datetime.now().timestamp())
+    ft_ref = f"FT{datetime.datetime.now().strftime('%y%j')}{random.randint(10000, 99999)}"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    txn_id = f"TXN-{timestamp_str}"
+    status = 'PENDING_MANAGER' if force_manual else 'APPROVED'
+
+    cursor.execute("""
+        INSERT INTO transactions (txn_id, txn_type, customer_id, customer_name, target_account, amount, commission, bank_name, ft_reference, status, created_by, timestamp)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+    """, (txn_id, txn_type, cust['customer_id'], cust['full_name'], target_account, amount, commission,
+          bank_name, ft_ref, status, cust['customer_id'], now))
+
+    if not force_manual:
+        cursor.execute("UPDATE customers SET balance = balance - %s WHERE customer_id = %s;",
+                       (total_deduction, cust['customer_id']))
+        if txn_type == 'P2P_TRANSFER':
+            cursor.execute("UPDATE customers SET balance = balance + %s WHERE customer_id = %s;",
+                           (amount, target_account))
+
+    conn.commit()
+    cursor.close(); conn.close()
+
+    add_notification(f"Customer {cust['customer_id']} app irraa {txn_type} {amount:,.2f} Birr ({ft_ref}) {'galmeesse - manager eeggata' if force_manual else 'raawwateera'}")
+    send_sms_alert(cust['phone'], f"{txn_type} {amount:,.2f} Birr (Ref: {ft_ref}) {'galmaa\'ee jira' if force_manual else 'milkaa\'ina xumurameera'}. {extra_note}")
+
+    return jsonify(success=True, ft_reference=ft_ref, txn_id=txn_id, status=status,
+                    message="Milkaa'ina xumurameera" if not force_manual else "Hamma guddaa waan ta'eef mirkaneessa managerii eega"), 200
+
+
+@app.route('/api/customer/transfer', methods=['POST'])
+def api_customer_transfer():
+    """Customer-to-customer transfer inside our own bank — no manager approval."""
+    data = request.get_json(silent=True) or request.form
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+
+    target_account = (data.get('target_account') or '').strip()
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify(success=False, message="Hamma maallaqaa sirrii galchaa"), 400
+
+    if not target_account:
+        return jsonify(success=False, message="Herrega nama fudhatuu galchaa"), 400
+
+    resp, code = _customer_self_service_txn(cust, 'P2P_TRANSFER', target_account, amount, 'Imana Microfinance Core')
+    return resp, code
+
+
+@app.route('/api/customer/interbank_transfer', methods=['POST'])
+def api_customer_interbank_transfer():
+    """Send money out to another bank. NOTE: this records/deducts on our side only —
+    it does NOT itself move money at the other bank. Wiring this to an actual payment
+    switch (EthSwitch / a bank's real transfer API) is a separate integration; see
+    the note in the chat reply about that."""
+    data = request.get_json(silent=True) or request.form
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+
+    dest_bank = (data.get('bank_name') or '').strip()
+    dest_account = (data.get('account_number') or '').strip()
+    dest_name = (data.get('account_name') or '').strip()
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify(success=False, message="Hamma maallaqaa sirrii galchaa"), 400
+
+    if not dest_bank or not dest_account:
+        return jsonify(success=False, message="Maqaa baankii fi lakkoofsa herrega galchaa"), 400
+
+    target_ref = f"{dest_bank}:{dest_account}:{dest_name}"
+    resp, code = _customer_self_service_txn(cust, 'INTERBANK_TRANSFER', target_ref, amount, dest_bank,
+                                             extra_note=f"Gara {dest_bank} - {dest_account}")
+    return resp, code
+
+
+@app.route('/api/customer/pay_bill', methods=['POST'])
+def api_customer_pay_bill():
+    """Pay a bill / merchant / utility. No manager approval."""
+    data = request.get_json(silent=True) or request.form
+    cust = get_customer_by_token(get_bearer_token())
+    if not cust:
+        return jsonify(success=False, message="Seensi hin milkoofne, irra deebi'ii seeni"), 401
+
+    biller = (data.get('biller') or '').strip()
+    reference = (data.get('reference') or '').strip()
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify(success=False, message="Hamma maallaqaa sirrii galchaa"), 400
+
+    if not biller:
+        return jsonify(success=False, message="Maqaa/koodii kaffaltii galchaa"), 400
+
+    resp, code = _customer_self_service_txn(cust, 'BILL_PAYMENT', reference or biller, amount, biller,
+                                             extra_note=f"Kaffaltii {biller}")
+    return resp, code
+
+
+# --- MANAGER: issue/reset a customer's mobile-app PIN (e.g. right after approving them) ---
+@app.route('/set_customer_pin/<cust_id>', methods=['POST'])
+def set_customer_pin(cust_id):
+    if 'role' not in session or session['role'] not in ['MANAGER', 'CEO']:
+        return "🚫 Hayyama Manager/CEO qofa!", 403
+
+    new_pin = (request.form.get('pin') or '').strip()
+    if not new_pin or len(new_pin) < 4:
+        return "❌ PIN yoo xiqqaate lakkoofsa 4 qabaachuu qaba", 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE customers SET pin = %s WHERE customer_id = %s;",
+                   (generate_password_hash(new_pin), cust_id))
+    conn.commit()
+    cursor.close(); conn.close()
+    add_notification(f"PIN app maammila {cust_id} tiif {session['role']}n kenname/jijjiirame.")
+    return redirect('/customers')
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
