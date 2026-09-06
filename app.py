@@ -6,6 +6,9 @@ import random
 import sys
 import time
 import secrets
+import json
+import threading
+from decimal import Decimal
 from io import BytesIO
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -20,7 +23,11 @@ from flask import Flask, request, redirect, url_for, session, render_template_st
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = "imana_free_interest_microfinance_secret_key"
+app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+if not os.environ.get('SECRET_KEY'):
+    print("⚠️ SECRET_KEY env variable hin argamne — yeroo ammaa random tokko fayyadamnee jirra. "
+          "Render (ykn deploy) irratti SECRET_KEY dabaluun barbaachisaadha, yoo hin dabalamin "
+          "restart hunda booda session/login jiraan hundi cabu (logout godhu).")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
@@ -118,7 +125,9 @@ def init_db():
             ('officer1', 'officer123', 'LOAN_OFFICER', 'ACTIVE')
         ]
         for u in default_users:
-            cursor.execute("INSERT INTO users (username, password, role, status) VALUES (%s, %s, %s, %s);", u)
+            username, plain_pw, role, status = u
+            cursor.execute("INSERT INTO users (username, password, role, status) VALUES (%s, %s, %s, %s);",
+                           (username, generate_password_hash(plain_pw), role, status))
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS customers (
@@ -199,6 +208,23 @@ def init_db():
         );
     """)
 
+    # --- MIGRATION: auto-backup / auto-restore support (CEO controlled) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backups (
+            backup_id VARCHAR(100) PRIMARY KEY,
+            created_by VARCHAR(100),
+            created_at VARCHAR(100),
+            data TEXT NOT NULL,
+            size_bytes INTEGER DEFAULT 0
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key VARCHAR(100) PRIMARY KEY,
+            setting_value TEXT
+        );
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -209,6 +235,133 @@ init_db()
 # Set env var CUSTOMER_TXN_AUTO_LIMIT to a number to force anything above it into the
 # manager queue instead of auto-approving. Leave at 0 to fully disable (no cap at all).
 CUSTOMER_TXN_AUTO_LIMIT = float(os.environ.get('CUSTOMER_TXN_AUTO_LIMIT', 0))
+
+# --- AUTO-BACKUP / AUTO-RESTORE SYSTEM (CEO ONLY) -----------------------------
+# Tables backed up (customer_sessions/backups/app_settings are excluded on purpose:
+# sessions are disposable, and backing up the backups table into itself is pointless).
+BACKUP_TABLES = ['users', 'customers', 'transactions', 'reversals', 'islamic_financing']
+
+def _json_default(o):
+    if isinstance(o, Decimal):
+        return float(o)
+    return str(o)
+
+def get_setting(key, default=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT setting_value FROM app_settings WHERE setting_key = %s;", (key,))
+    row = cursor.fetchone()
+    cursor.close(); conn.close()
+    return row['setting_value'] if row else default
+
+def set_setting(key, value):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO app_settings (setting_key, setting_value) VALUES (%s, %s)
+        ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value;
+    """, (key, value))
+    conn.commit()
+    cursor.close(); conn.close()
+
+def create_backup(triggered_by):
+    """Dumps all core banking tables into one JSON snapshot row in the `backups` table."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    dump = {}
+    for t in BACKUP_TABLES:
+        cursor.execute(f"SELECT * FROM {t};")
+        dump[t] = [dict(r) for r in cursor.fetchall()]
+
+    payload = json.dumps(dump, default=_json_default)
+    backup_id = f"BKP-{int(datetime.datetime.now().timestamp())}"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO backups (backup_id, created_by, created_at, data, size_bytes)
+        VALUES (%s, %s, %s, %s, %s);
+    """, (backup_id, triggered_by, now, payload, len(payload)))
+    conn.commit()
+
+    # Retention: keep only the newest N backups so the DB doesn't grow forever.
+    keep = int(get_setting('backup_retention_count', '30') or 30)
+    cursor.execute("SELECT backup_id FROM backups ORDER BY created_at ASC;")
+    all_ids = [r['backup_id'] for r in cursor.fetchall()]
+    if len(all_ids) > keep:
+        to_delete = all_ids[:len(all_ids) - keep]
+        cursor.execute("DELETE FROM backups WHERE backup_id = ANY(%s);", (to_delete,))
+        conn.commit()
+
+    cursor.close(); conn.close()
+    add_notification(f"💾 Backup {backup_id} ({triggered_by}) uumameera.")
+    return backup_id
+
+def restore_backup(backup_id, restored_by):
+    """Restores all core tables from a stored snapshot. Always takes a safety
+    snapshot of the CURRENT state first, so a bad restore can itself be undone."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT data FROM backups WHERE backup_id = %s;", (backup_id,))
+    row = cursor.fetchone()
+    cursor.close(); conn.close()
+    if not row:
+        return False, "❌ Backup-iin kun hin argamne."
+
+    dump = json.loads(row['data'])
+
+    # Safety net: snapshot current (pre-restore) state before overwriting anything.
+    create_backup(f"AUTO_PRE_RESTORE_by_{restored_by}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        for t in BACKUP_TABLES:
+            rows = dump.get(t, [])
+            cursor.execute(f"DELETE FROM {t};")
+            if rows:
+                cols = list(rows[0].keys())
+                col_names = ", ".join(cols)
+                placeholders = ", ".join(["%s"] * len(cols))
+                insert_sql = f"INSERT INTO {t} ({col_names}) VALUES ({placeholders});"
+                for r in rows:
+                    cursor.execute(insert_sql, tuple(r[c] for c in cols))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cursor.close(); conn.close()
+        return False, f"❌ Restore dogongora: {e}"
+
+    cursor.close(); conn.close()
+    add_notification(f"♻️ Backup {backup_id} deebi'ee bu'uureffameera ({restored_by}).")
+    return True, "✅ Deebi'ee bu'uureffamuun (restore) milkaa'eera!"
+
+def _autobackup_loop():
+    """Background loop: runs inside the single gunicorn worker and periodically
+    checks whether it's time for an automatic backup, based on CEO-controlled settings."""
+    # Small startup delay so this doesn't race the very first request/init_db.
+    time.sleep(30)
+    while True:
+        try:
+            enabled = (get_setting('autobackup_enabled', 'true') or 'true').lower() == 'true'
+            if enabled:
+                interval_hours = float(get_setting('autobackup_interval_hours', '24') or 24)
+                last_at = get_setting('last_auto_backup_at')
+                due = True
+                if last_at:
+                    try:
+                        last_dt = datetime.datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")
+                        due = (datetime.datetime.now() - last_dt).total_seconds() >= interval_hours * 3600
+                    except Exception:
+                        due = True
+                if due:
+                    create_backup('AUTO')
+                    set_setting('last_auto_backup_at', datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as e:
+            print(f"⚠️ Autobackup loop error: {e}")
+        time.sleep(1800)  # re-check every 30 minutes
+
+_autobackup_thread = threading.Thread(target=_autobackup_loop, daemon=True)
+_autobackup_thread.start()
 
 def get_customer_by_token(token):
     """Looks up the customer tied to a mobile-app bearer token."""
@@ -411,6 +564,7 @@ HTML_LAYOUT = """
             <a href="/reversals_list" style="color: #581c87;"><span class="icon">🔄</span>Reversal CEO</a>
             <a href="/ceo_mudaraba_list" style="color: #581c87;"><span class="icon">🤝</span>Mudaraba List</a>
             <a href="/manage_users" style="color: #6b21a8;"><span class="icon">⚙️</span>Hojjattoota</a>
+            <a href="/admin/backups" style="color: #6b21a8;"><span class="icon">💾</span>Backup</a>
         {% endif %}
     </div>
     {% endif %}
@@ -447,12 +601,30 @@ def login():
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT username, role, status FROM users WHERE username = %s AND password = %s;", (username, password))
+        cursor.execute("SELECT username, password, role, status FROM users WHERE username = %s;", (username,))
         user = cursor.fetchone()
         cursor.close()
         conn.close()
 
+        valid = False
         if user:
+            stored = user['password'] or ''
+            if stored.startswith(('pbkdf2:', 'scrypt:', 'argon2')):
+                # Modern hashed password.
+                valid = check_password_hash(stored, password)
+            else:
+                # Legacy plaintext row from before hashing was added — compare directly,
+                # then transparently upgrade it to a hash so it's never stored in plaintext again.
+                valid = (stored == password)
+                if valid:
+                    up_conn = get_db_connection()
+                    up_cursor = up_conn.cursor()
+                    up_cursor.execute("UPDATE users SET password = %s WHERE username = %s;",
+                                      (generate_password_hash(password), username))
+                    up_conn.commit()
+                    up_cursor.close(); up_conn.close()
+
+        if valid:
             if user['status'] == 'BLOCKED':
                 error = "🚫 Akkaawunttii keessan UGGURAMEERA! CEO qunnamaa."
             else:
@@ -593,7 +765,7 @@ def manage_users():
                 if cursor.fetchone():
                     msg = "❌ User-n kun duraan galmaa'eera!"
                 else:
-                    cursor.execute("INSERT INTO users (username, password, role, status) VALUES (%s, %s, %s, 'ACTIVE');", (username, password, role))
+                    cursor.execute("INSERT INTO users (username, password, role, status) VALUES (%s, %s, %s, 'ACTIVE');", (username, generate_password_hash(password), role))
                     conn.commit()
                     msg = f"✅ User {username} ({role}) milkaa'inaan uumameera!"
         elif action == 'toggle_status':
@@ -603,6 +775,17 @@ def manage_users():
                 cursor.execute("UPDATE users SET status = %s WHERE username = %s;", (new_status, target_user))
                 conn.commit()
                 msg = f"✅ Status {target_user} gara {new_status} 'ttii jijjiirameera."
+        elif action == 'reset_password':
+            target_user = request.form.get('username', '').strip()
+            new_password = request.form.get('new_password', '').strip()
+            if not new_password or len(new_password) < 4:
+                msg = "❌ Password haaraa yoo xiqqaate lakkoofsa/qubee 4 qabaachuu qaba."
+            else:
+                cursor.execute("UPDATE users SET password = %s WHERE username = %s;",
+                               (generate_password_hash(new_password), target_user))
+                conn.commit()
+                msg = f"✅ Password {target_user} tiif haaromfameera (reset)."
+                add_notification(f"🔑 Password hojjataa {target_user} CEO-n haaromfame.")
 
     cursor.execute("SELECT username, role, status FROM users ORDER BY username ASC;")
     users_list = cursor.fetchall()
@@ -636,8 +819,28 @@ def manage_users():
             <td style="padding:8px; font-weight:bold;">{u['username']}</td>
             <td style="padding:8px;"><span class="role-badge">{u['role']}</span></td>
             <td style="padding:8px;"><span class="badge {status_badge}">{u['status']}</span></td>
-            <td style="padding:8px; text-align:right;">{toggle_btn}</td>
+            <td style="padding:8px; text-align:right; white-space:nowrap;">
+                {toggle_btn}
+                <button type="button" class="btn-action btn-purple" style="font-size:10px; padding:3px 6px;"
+                        onclick="document.getElementById('reset_pw_modal_{u['username']}').style.display='flex'">🔑 Reset PW</button>
+            </td>
         </tr>
+        <div id="reset_pw_modal_{u['username']}" class="modal">
+            <div class="modal-content">
+                <h4 style="color:#7c3aed; font-size:14px;">🔑 Password Haaromsi — {u['username']}</h4>
+                <p style="font-size:12px; color:#475569;">Password haaraa galchi; namni kun password haaraa kanaan seena.</p>
+                <form method="POST">
+                    <input type="hidden" name="action" value="reset_password">
+                    <input type="hidden" name="username" value="{u['username']}">
+                    <div class="form-group">
+                        <input type="text" name="new_password" placeholder="Password haaraa" class="input-field" required minlength="4">
+                    </div>
+                    <button type="submit" class="btn-submit" style="background:#7c3aed;">✅ Password Haaromsi</button>
+                    <button type="button" class="btn-action" style="background:#64748b; margin-top:8px; width:100%; text-align:center;"
+                            onclick="document.getElementById('reset_pw_modal_{u['username']}').style.display='none'">Haqi (Cancel)</button>
+                </form>
+            </div>
+        </div>
         """
 
     content = f"""
@@ -686,6 +889,156 @@ def manage_users():
     </div>
     """
     return render_template_string(HTML_LAYOUT.replace("{% block content %}{% endblock %}", content), notifications=NOTIFICATIONS)
+
+# --- CEO: AUTO-BACKUP / AUTO-RESTORE CONTROL PANEL ---
+@app.route('/admin/backups', methods=['GET', 'POST'])
+def admin_backups():
+    if 'role' not in session or session['role'] != 'CEO':
+        return "🚫 Shoora CEO qofatu backup to'achuu danda'a", 403
+
+    msg = None
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+
+        if action == 'create_now':
+            bid = create_backup(session['username'])
+            msg = f"✅ Backup haaraa {bid} uumameera!"
+
+        elif action == 'save_settings':
+            enabled = 'true' if request.form.get('autobackup_enabled') == 'on' else 'false'
+            interval = (request.form.get('autobackup_interval_hours') or '24').strip()
+            retention = (request.form.get('backup_retention_count') or '30').strip()
+            set_setting('autobackup_enabled', enabled)
+            set_setting('autobackup_interval_hours', interval)
+            set_setting('backup_retention_count', retention)
+            msg = "✅ Qindaa'inni Auto-Backup sirreeffameera!"
+
+        elif action == 'restore':
+            backup_id = request.form.get('backup_id')
+            confirm = (request.form.get('confirm') or '').strip()
+            if confirm != 'RESTORE':
+                msg = "❌ Restore gochuuf 'RESTORE' jettee barreessuu qabda (mirkaneessaaf)."
+            else:
+                ok, rmsg = restore_backup(backup_id, session['username'])
+                msg = rmsg
+
+    autobackup_enabled = (get_setting('autobackup_enabled', 'true') or 'true') == 'true'
+    interval_hours = get_setting('autobackup_interval_hours', '24')
+    retention_count = get_setting('backup_retention_count', '30')
+    last_auto = get_setting('last_auto_backup_at', 'Hin jiru (Amma hin uumamne)')
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT backup_id, created_by, created_at, size_bytes FROM backups ORDER BY created_at DESC LIMIT 100;")
+    backups_list = cursor.fetchall()
+    cursor.close(); conn.close()
+
+    rows_html = ""
+    for b in backups_list:
+        size_kb = (b['size_bytes'] or 0) / 1024.0
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #e2e8f0; font-size:12px;">
+            <td style="padding:8px; font-weight:bold;">{b['backup_id']}</td>
+            <td style="padding:8px;">{b['created_by']}</td>
+            <td style="padding:8px;">{b['created_at']}</td>
+            <td style="padding:8px;">{size_kb:.1f} KB</td>
+            <td style="padding:8px; text-align:right; white-space:nowrap;">
+                <a href="/admin/backups/download/{b['backup_id']}" class="btn-action btn-blue" style="font-size:10px; padding:3px 6px;">⬇️ Download</a>
+                <button type="button" class="btn-action btn-orange" style="font-size:10px; padding:3px 6px;"
+                        onclick="document.getElementById('restore_modal_{b['backup_id']}').style.display='flex'">♻️ Restore</button>
+            </td>
+        </tr>
+        <div id="restore_modal_{b['backup_id']}" class="modal">
+            <div class="modal-content">
+                <h4 style="color:#dc2626; font-size:14px;">⚠️ Restore Mirkaneessi</h4>
+                <p style="font-size:12px; color:#475569;">
+                    Kun deetaa ammaa (customers, transactions, users...) hunda balleessee, backup
+                    <b>{b['backup_id']}</b> ({b['created_at']}) tiin bakka buusa. Dura backup-iin ammaa
+                    ofumaan uumama (undo danda'ama). Mirkaneessuuf gadii "RESTORE" jettee barreessi.
+                </p>
+                <form method="POST">
+                    <input type="hidden" name="action" value="restore">
+                    <input type="hidden" name="backup_id" value="{b['backup_id']}">
+                    <div class="form-group">
+                        <input type="text" name="confirm" placeholder="RESTORE jettee barreessi" class="input-field" required>
+                    </div>
+                    <button type="submit" class="btn-submit" style="background:#dc2626;">♻️ Eeyyee, Restore Godhi</button>
+                    <button type="button" class="btn-action" style="background:#64748b; margin-top:8px; width:100%; text-align:center;"
+                            onclick="document.getElementById('restore_modal_{b['backup_id']}').style.display='none'">Haqi (Cancel)</button>
+                </form>
+            </div>
+        </div>
+        """
+
+    content = f"""
+    <div class="box">
+        <h2 style="font-size: 16px; color:#581c87; margin-bottom: 12px;">💾 Backup &amp; Restore (CEO)</h2>
+        {f"<p style='background:#dcfce7; color:#166534; padding:10px; border-radius:6px; font-size:12px; font-weight:bold; margin-bottom:12px;'>{msg}</p>" if msg else ""}
+
+        <div style="background:#faf5ff; padding:12px; border-radius:8px; border:1px solid #e9d5ff; margin-bottom:16px;">
+            <h4 style="font-size:13px; color:#581c87; margin-bottom:8px;">⚙️ Qindaa'ina Auto-Backup</h4>
+            <form method="POST">
+                <input type="hidden" name="action" value="save_settings">
+                <div class="form-group" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" name="autobackup_enabled" id="ab_enabled" {"checked" if autobackup_enabled else ""} style="width:auto;">
+                    <label for="ab_enabled" style="margin:0;">Auto-Backup Banii (Enable)</label>
+                </div>
+                <div class="form-group">
+                    <label>Yeroo gidduu (sa'aatiidhaan)</label>
+                    <input type="number" step="0.5" min="1" name="autobackup_interval_hours" value="{interval_hours}" class="input-field">
+                </div>
+                <div class="form-group">
+                    <label>Backup meeqa turfamu (Retention count)</label>
+                    <input type="number" step="1" min="1" name="backup_retention_count" value="{retention_count}" class="input-field">
+                </div>
+                <p style="font-size:11px; color:#64748b; margin-bottom:8px;">Backup dhumaa ofumaan: {last_auto}</p>
+                <button type="submit" class="btn-submit" style="background:#7c3aed;">💾 Qindaa'ina Olkaa'i</button>
+            </form>
+        </div>
+
+        <form method="POST" style="margin-bottom:16px;">
+            <input type="hidden" name="action" value="create_now">
+            <button type="submit" class="btn-submit" style="background:#16a34a;">💾 Amma Backup Uumi (Manual)</button>
+        </form>
+
+        <h3 style="font-size:14px; margin-bottom:8px; color:#334155;">📋 Tarree Backup-oota</h3>
+        <table style="width:100%; border-collapse:collapse; text-align:left;">
+            <thead>
+                <tr style="background:#f8fafc; font-size:11px; color:#64748b; border-bottom:1px solid #e2e8f0;">
+                    <th style="padding:8px;">Backup ID</th>
+                    <th style="padding:8px;">Namni Uume</th>
+                    <th style="padding:8px;">Yeroo</th>
+                    <th style="padding:8px;">Guddina</th>
+                    <th style="padding:8px; text-align:right;">Tarkaanfii</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_template_string(HTML_LAYOUT.replace("{% block content %}{% endblock %}", content), notifications=NOTIFICATIONS)
+
+
+@app.route('/admin/backups/download/<backup_id>')
+def admin_backup_download(backup_id):
+    if 'role' not in session or session['role'] != 'CEO':
+        return "🚫 Shoora CEO qofatu backup buufachuu danda'a", 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT data FROM backups WHERE backup_id = %s;", (backup_id,))
+    row = cursor.fetchone()
+    cursor.close(); conn.close()
+    if not row:
+        return "❌ Backup hin argamne", 404
+
+    buf = BytesIO(row['data'].encode('utf-8'))
+    buf.seek(0)
+    return send_file(buf, mimetype='application/json', as_attachment=True,
+                      download_name=f"{backup_id}.json")
 
 # --- MAKER TRANSACTION ROUTE (WITH FULL ACCOUNT VERIFICATION) ---
 @app.route('/transaction', methods=['GET', 'POST'])
